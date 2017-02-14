@@ -99,6 +99,7 @@ class ScheduleEntry(object):
         self.last_run_at = last_run_at or self._default_now()
         self.total_run_count = total_run_count or 0
 
+
     def _default_now(self):
         return self.schedule.now() if self.schedule else self.app.now()
 
@@ -197,6 +198,7 @@ class Scheduler(object):
                              self.max_interval)
         self.Producer = Producer or app.amqp.Producer
         self._heap = None
+        self.old_schedulers = None
         self.sync_every_tasks = (
             app.conf.beat_sync_every if sync_every_tasks is None
             else sync_every_tasks)
@@ -232,21 +234,10 @@ class Scheduler(object):
     def is_due(self, entry):
         return entry.is_due()
 
-    def _when(self, entry, next_time_to_run, mktime=time.mktime):
-        adjust = self.adjust
-
-        return (mktime(entry.schedule.now().timetuple()) +
-                (adjust(next_time_to_run) or 0))
-
-    def populate_heap(self, event_t=event_t, heapify=heapq.heapify):
-        """Populate the heap with the data contained in the schedule."""
-        self._heap = [event_t(self._when(e, e.is_due()[1]) or 0, 5, e)
-                      for e in values(self.schedule)]
-        heapify(self._heap)
-
     # pylint disable=redefined-outer-name
-    def tick(self, event_t=event_t, min=min, heappop=heapq.heappop,
-             heappush=heapq.heappush):
+    def tick(self, event_t=event_t, min=min,
+             heappop=heapq.heappop, heappush=heapq.heappush,
+             heapify=heapq.heapify, mktime=time.mktime):
         """Run a tick - one iteration of the scheduler.
 
         Executes one due task per call.
@@ -254,14 +245,19 @@ class Scheduler(object):
         Returns:
             float: preferred delay in seconds for next call.
         """
+        def _when(entry, next_time_to_run):
+            return (mktime(entry.schedule.now().timetuple()) +
+                    (adjust(next_time_to_run) or 0))
+
         adjust = self.adjust
         max_interval = self.max_interval
-
-        if self._heap is None:
-            self.populate_heap()
-
         H = self._heap
-
+        #if H is None:
+        if H is None or not self.schedules_equal(self.old_schedulers,self.schedule):
+            H = self._heap = [event_t(_when(e, e.is_due()[1]) or 0, 5, e)
+                              for e in values(self.schedule)]
+            heapify(H)
+            self.old_schedulers = self.schedule
         if not H:
             return max_interval
 
@@ -273,13 +269,28 @@ class Scheduler(object):
             if verify is event:
                 next_entry = self.reserve(entry)
                 self.apply_entry(entry, producer=self.producer)
-                heappush(H, event_t(self._when(next_entry, next_time_to_run),
+                heappush(H, event_t(_when(next_entry, next_time_to_run),
                                     event[1], next_entry))
                 return 0
             else:
                 heappush(H, verify)
                 return min(verify[0], max_interval)
         return min(adjust(next_time_to_run) or max_interval, max_interval)
+
+    def schedules_equal(self, a, b):
+        if a.keys() != b.keys():
+            return False
+        for name, model in a.items():
+            b_model = b.get(name)
+            if not b_model:
+                return False
+            if not hasattr(model.schedule, "human_seconds"):
+                # Not checking crontabs
+                continue
+            if model.schedule.human_seconds != b_model.schedule.human_seconds:
+                return False
+        return True
+
 
     def should_sync(self):
         return (
@@ -395,7 +406,7 @@ class Scheduler(object):
 
     @cached_property
     def producer(self):
-        return self.Producer(self._ensure_connected(), auto_declare=False)
+        return self.Producer(self._ensure_connected())
 
     @property
     def info(self):
@@ -525,6 +536,7 @@ class Service(object):
 
         self._is_shutdown = Event()
         self._is_stopped = Event()
+
 
     def __reduce__(self):
         return self.__class__, (self.max_interval, self.schedule_filename,
